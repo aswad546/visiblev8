@@ -47,6 +47,32 @@ func (agg *flowAggregator) IngestRecord(ctx *core.ExecutionContext, lineNumber i
 		case 'g', 's':
 			receiver, _ = core.StripCurlies(fields[1])
 			member, _ = core.StripQuotes(fields[2])
+			/*
+			* When code is 's' it is a setter call (e.g. HTMLInputElement.value = Navigator.userAgent)
+			* VV8 is dependent on the V8 trace for correct offset retrieval. The offset is incorrect
+			* so to fix this we readjust the offset and move it to the correct position. In the example
+			* above VV8 will return the offset of the HTMLInputElement.value API at the position of the
+			* equal to sign.
+			 */
+			correctedOffset := offset - len(member)
+			if op == 's' && len(member) > 0 && offset+len(member) < len(ctx.Script.Code) && ctx.Script.Code[offset:offset+len(member)] != member {
+				//Attempt to find correct offset
+				count := 0
+				for {
+					if correctedOffset >= 0 && ctx.Script.Code[correctedOffset:correctedOffset+len(member)] == member {
+						break
+					}
+					if correctedOffset < 0 || count > 5 {
+						break
+					}
+					correctedOffset = correctedOffset - 1
+					count++
+				}
+				if correctedOffset >= 0 && count <= 5 {
+					offset = correctedOffset
+				}
+
+			}
 		case 'n':
 			receiver, _ = core.StripCurlies(fields[1])
 			receiver = strings.TrimPrefix(receiver, "%")
@@ -55,6 +81,15 @@ func (agg *flowAggregator) IngestRecord(ctx *core.ExecutionContext, lineNumber i
 			member, _ = core.StripQuotes(fields[1])
 
 			member = strings.TrimPrefix(member, "%")
+
+			//Attaching event listened to with addEventListener to the respective event
+			if member == "addEventListener" && len(fields) >= 4 {
+				event, _ := core.StripQuotes(fields[3])
+				member = fmt.Sprintf("%s.%s", member, event) // API will appear in db as addEventListener.event
+			} else if member == "setAttribute" && len(fields) >= 4 {
+				attribute, _ := core.StripQuotes(fields[3])
+				member = fmt.Sprintf("%s.%s", member, attribute)
+			}
 		default:
 			return fmt.Errorf("%d: invalid mode '%c'; fields: %v", lineNumber, op, fields)
 		}
