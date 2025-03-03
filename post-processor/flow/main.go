@@ -103,6 +103,7 @@ var scriptFlowFields = [...]string{
 	"evaled_by",
 	"apis",
 	"first_origin",
+	"submission_id",
 }
 
 func (agg *flowAggregator) DumpToPostgresql(ctx *core.AggregationContext, sqlDb *sql.DB) error {
@@ -136,7 +137,10 @@ func (agg *flowAggregator) DumpToPostgresql(ctx *core.AggregationContext, sqlDb 
 			script.info.URL,
 			evaledById,
 			pq.Array(script.APIs),
-			script.info.FirstOrigin.Origin)
+			script.info.FirstOrigin.Origin,
+			ctx.SubmissionID.String(),
+		)
+			
 
 		if err != nil {
 			txn.Rollback()
@@ -178,6 +182,7 @@ func (agg *flowAggregator) DumpToStream(ctx *core.AggregationContext, stream io.
 			"IsEvaledBy":  evaledById,
 			"FirstOrigin": script.info.FirstOrigin,
 			"APIs":        script.APIs,
+			
 		}})
 	}
 
