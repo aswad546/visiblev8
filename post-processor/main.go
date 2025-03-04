@@ -285,6 +285,7 @@ func invoke(args []string, topLevel bool) error {
 		aggCtx.Ln = core.NewLogInfo(aggCtx.LogOid, aggCtx.RootName, aggCtx.SubmissionID)
 		err = aggCtx.Ln.IngestStream(inputStream, aggregators...)
 		if err != nil {
+			log.Printf("Error in IngestStream %v", err)
 			return err
 		}
 
@@ -292,6 +293,7 @@ func invoke(args []string, topLevel bool) error {
 			log.Printf("Started dumping for aggregator...\n")
 			err = outputDriver(agg, &aggCtx)
 			if err != nil {
+				log.Printf("Error in main.go %v", err)
 				return err
 			}
 		}

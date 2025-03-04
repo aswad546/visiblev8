@@ -108,59 +108,62 @@ var scriptFlowFields = [...]string{
 
 func (agg *flowAggregator) DumpToPostgresql(ctx *core.AggregationContext, sqlDb *sql.DB) error {
 
-	txn, err := sqlDb.Begin()
-	if err != nil {
-		return err
-	}
+    txn, err := sqlDb.Begin()
+    if err != nil {
+        log.Printf("Error beginning transaction: %v", err)
+        return err
+    }
 
-	stmt, err := txn.Prepare(pq.CopyIn("script_flow", scriptFlowFields[:]...))
-	if err != nil {
-		txn.Rollback()
-		return err
-	}
+    stmt, err := txn.Prepare(pq.CopyIn("script_flow", scriptFlowFields[:]...))
+    if err != nil {
+        log.Printf("Error preparing statement: %v", err)
+        txn.Rollback()
+        return err
+    }
+    log.Printf("Dumping to Postgresql with submission id: %v", ctx.SubmissionID)
+    log.Printf("scriptFlow: %d scripts analysed", len(agg.scriptList))
 
-	log.Printf("scriptFlow: %d scripts analysed", len(agg.scriptList))
+    for _, script := range agg.scriptList {
+        evaledBy := script.info.EvaledBy
 
-	for _, script := range agg.scriptList {
-		evaledBy := script.info.EvaledBy
+        evaledById := -1
+       	if evaledBy != nil {
+            evaledById = evaledBy.ID
+        }
 
-		evaledById := -1
-		if evaledBy != nil {
-			evaledById = evaledBy.ID
-		}
+        _, err = stmt.Exec(
+            script.info.Isolate.ID,
+            script.info.VisibleV8,
+            script.info.Code,
+            script.info.CodeHash.SHA2[:],
+            script.info.URL,
+            evaledById,
+            pq.Array(script.APIs),
+            script.info.FirstOrigin.Origin,
+            ctx.SubmissionID.String(),
+        )
+        if err != nil {
+            log.Printf("Error executing statement for script %v: %v", script.info.ID, err)
+            txn.Rollback()
+            return err
+        }
+    }
 
-		_, err = stmt.Exec(
-			script.info.Isolate.ID,
-			script.info.VisibleV8,
-			script.info.Code,
-			script.info.CodeHash.SHA2[:],
-			script.info.URL,
-			evaledById,
-			pq.Array(script.APIs),
-			script.info.FirstOrigin.Origin,
-			ctx.SubmissionID.String(),
-		)
-			
+    err = stmt.Close()
+    if err != nil {
+        log.Printf("Error closing statement: %v", err)
+        txn.Rollback()
+        return err
+    }
+    err = txn.Commit()
+    if err != nil {
+        log.Printf("Error committing transaction: %v", err)
+        return err
+    }
 
-		if err != nil {
-			txn.Rollback()
-			return err
-		}
-
-	}
-
-	err = stmt.Close()
-	if err != nil {
-		txn.Rollback()
-		return err
-	}
-	err = txn.Commit()
-	if err != nil {
-		return err
-	}
-
-	return nil
+    return nil
 }
+
 
 func (agg *flowAggregator) DumpToStream(ctx *core.AggregationContext, stream io.Writer) error {
 	jstream := json.NewEncoder(stream)

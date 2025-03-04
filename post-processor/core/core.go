@@ -314,6 +314,7 @@ func (ln *LogInfo) IngestStream(stream io.Reader, aggs ...Aggregator) error {
 				for _, agg := range aggs {
 					err := agg.IngestRecord(&ln.World.Context, lineCount, code, fields)
 					if err != nil {
+						log.Printf("Error in IngestRecord at line %d: %v", lineCount, err)
 						return err
 					}
 				}
