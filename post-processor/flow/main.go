@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net/http"
+	"bytes"
 	"strconv"
 	"strings"
 
@@ -53,7 +55,6 @@ func (agg *flowAggregator) IngestRecord(ctx *core.ExecutionContext, lineNumber i
 		case 'c':
 			receiver, _ = core.StripCurlies(fields[2])
 			member, _ = core.StripQuotes(fields[1])
-
 			member = strings.TrimPrefix(member, "%")
 		default:
 			return fmt.Errorf("%d: invalid mode '%c'; fields: %v", lineNumber, op, fields)
@@ -76,7 +77,6 @@ func (agg *flowAggregator) IngestRecord(ctx *core.ExecutionContext, lineNumber i
 		}
 
 		script, ok := agg.scriptList[ctx.Script.ID]
-
 		if !ok {
 			script = NewScript(ctx.Script)
 			agg.scriptList[ctx.Script.ID] = script
@@ -107,70 +107,145 @@ var scriptFlowFields = [...]string{
 }
 
 func (agg *flowAggregator) DumpToPostgresql(ctx *core.AggregationContext, sqlDb *sql.DB) error {
-
     txn, err := sqlDb.Begin()
     if err != nil {
         log.Printf("Error beginning transaction: %v", err)
         return err
     }
 
-    stmt, err := txn.Prepare(pq.CopyIn("script_flow", scriptFlowFields[:]...))
+    log.Printf("scriptFlow: %d scripts analysed", len(agg.scriptList))
+
+    // Build a bulk INSERT statement with placeholders.
+    var queryBuilder strings.Builder
+    var params []interface{}
+
+    // Write the beginning of the query.
+    queryBuilder.WriteString("INSERT INTO script_flow (")
+    // Convert the array to a slice so strings.Join works.
+    queryBuilder.WriteString(strings.Join(scriptFlowFields[:], ", "))
+    queryBuilder.WriteString(") VALUES ")
+
+    rowCount := 0
+    // For each script, add a row to the VALUES clause.
+    for _, script := range agg.scriptList {
+        if rowCount > 0 {
+            queryBuilder.WriteString(", ")
+        }
+        // For each row, add a group of placeholders.
+        placeholders := make([]string, len(scriptFlowFields))
+        for i := 0; i < len(scriptFlowFields); i++ {
+            placeholders[i] = "$" + strconv.Itoa(len(params)+i+1)
+        }
+        queryBuilder.WriteString("(")
+        queryBuilder.WriteString(strings.Join(placeholders, ", "))
+        queryBuilder.WriteString(")")
+
+        // Prepare the values for this script.
+        evaledById := -1
+        if script.info.EvaledBy != nil {
+            evaledById = script.info.EvaledBy.ID
+        }
+        params = append(params,
+            script.info.Isolate.ID,         // isolate
+            script.info.VisibleV8,          // visiblev8
+            script.info.Code,               // code
+            script.info.CodeHash.SHA2[:],    // sha256
+            script.info.URL,                // url
+            evaledById,                     // evaled_by
+            pq.Array(script.APIs),          // apis
+            script.info.FirstOrigin.Origin, // first_origin
+            ctx.SubmissionID.String(),      // submission_id
+        )
+
+        rowCount++
+    }
+
+    // If there are no rows to insert, just commit and return.
+    if rowCount == 0 {
+        log.Printf("No scripts to insert.")
+        if err := txn.Commit(); err != nil {
+            log.Printf("Error committing empty transaction: %v", err)
+            return err
+        }
+        return nil
+    }
+
+    // Add the RETURNING clause to fetch auto-generated IDs.
+    queryBuilder.WriteString(" RETURNING id")
+    query := queryBuilder.String()
+    log.Printf("Bulk insert query: %s", query)
+
+    // Execute the query.
+    rows, err := txn.Query(query, params...)
     if err != nil {
-        log.Printf("Error preparing statement: %v", err)
+        log.Printf("Error executing bulk insert: %v", err)
         txn.Rollback()
         return err
     }
-    log.Printf("Dumping to Postgresql with submission id: %v", ctx.SubmissionID)
-    log.Printf("scriptFlow: %d scripts analysed", len(agg.scriptList))
 
-    for _, script := range agg.scriptList {
-        evaledBy := script.info.EvaledBy
-
-        evaledById := -1
-       	if evaledBy != nil {
-            evaledById = evaledBy.ID
-        }
-
-        _, err = stmt.Exec(
-            script.info.Isolate.ID,
-            script.info.VisibleV8,
-            script.info.Code,
-            script.info.CodeHash.SHA2[:],
-            script.info.URL,
-            evaledById,
-            pq.Array(script.APIs),
-            script.info.FirstOrigin.Origin,
-            ctx.SubmissionID.String(),
-        )
-        if err != nil {
-            log.Printf("Error executing statement for script %v: %v", script.info.ID, err)
+    // Collect the returned IDs.
+    var scriptIDs []int
+    for rows.Next() {
+        var id int
+        if err := rows.Scan(&id); err != nil {
+            log.Printf("Error scanning returning id: %v", err)
             txn.Rollback()
             return err
         }
+        scriptIDs = append(scriptIDs, id)
     }
+    rows.Close()
 
-    err = stmt.Close()
-    if err != nil {
-        log.Printf("Error closing statement: %v", err)
-        txn.Rollback()
-        return err
-    }
-    err = txn.Commit()
-    if err != nil {
+    if err := txn.Commit(); err != nil {
         log.Printf("Error committing transaction: %v", err)
         return err
+    }
+
+    log.Printf("Inserted %d rows. Retrieved IDs: %v", rowCount, scriptIDs)
+
+    // Now that the transaction is committed, send the collected IDs to the next system.
+    if len(scriptIDs) > 0 {
+        if err := sendScriptIDs(scriptIDs); err != nil {
+            log.Printf("Error sending script IDs: %v", err)
+            return err
+        }
+    } else {
+        log.Printf("No script IDs to send.")
     }
 
     return nil
 }
 
 
+func sendScriptIDs(ids []int) error {
+	payload, err := json.Marshal(ids)
+	log.Printf("Sending payload: %s", payload)
+	if err != nil {
+		return fmt.Errorf("error marshalling JSON: %w", err)
+	}
+
+	url := "http://172.17.0.1:8100/analyze"
+	req, err := http.NewRequest("POST", url, bytes.NewBuffer(payload))
+	if err != nil {
+		return fmt.Errorf("error creating POST request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("error executing POST request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	log.Printf("POST request to %s returned status: %s", url, resp.Status)
+	return nil
+}
+
 func (agg *flowAggregator) DumpToStream(ctx *core.AggregationContext, stream io.Writer) error {
 	jstream := json.NewEncoder(stream)
 
 	for _, script := range agg.scriptList {
 		evaledBy := script.info.EvaledBy
-
 		evaledById := -1
 		if evaledBy != nil {
 			evaledById = evaledBy.ID
@@ -185,7 +260,6 @@ func (agg *flowAggregator) DumpToStream(ctx *core.AggregationContext, stream io.
 			"IsEvaledBy":  evaledById,
 			"FirstOrigin": script.info.FirstOrigin,
 			"APIs":        script.APIs,
-			
 		}})
 	}
 
