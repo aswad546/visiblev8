@@ -1,4 +1,4 @@
-PHONY: rust-build go-build fetch-easy-privacy build_entity_hashmap
+PHONY: go-build
 
 docker:
 	./build/docker.sh
